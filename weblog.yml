@@ -1,0 +1,26 @@
+- hosts: web
+  tasks:
+    - mount:
+        src: 192.168.0.90:/
+        path: /mnt
+        fstype: nfs
+        state: mounted
+    - file:
+        path: /mnt/logs
+        state: directory
+        mode: '0755'
+    - mount:
+        path: /mnt
+        state: unmounted
+    - mount:
+        src: 192.168.0.90:/logs
+        path: /var/log/httpd
+        fstype: nfs
+        state: mounted
+    - replace:
+        path: /etc/httpd/conf/httpd.conf
+        regexp: 'CustomLog "logs/access_log" combined'
+        replace: 'CustomLog "logs/{{ansible_hostname}}.log" combined'
+    - service:
+        name: httpd
+        state: restarted

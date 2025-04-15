@@ -1,0 +1,26 @@
+- hosts: es
+  vars:
+    replacements:
+      - { regexp: '#cluster.name: my-application', replace: 'cluster.name: my-es' }
+      - { regexp: '#node.name: node-1', replace: 'node.name: {{ansible_hostname}}' }
+      - { regexp: '#network.host: 192.168.0.1', replace: 'network.host: 0.0.0.0' }
+      - { regexp: '#discovery.seed_hosts: .*', replace: 'discovery.seed_hosts: ["ecs-es-0001", "ecs-es-0002", "ecs-es-0003"]' }
+      - { regexp: '#cluster.initial_master_nodes: .*', replace: 'cluster.initial_master_nodes: ["ecs-es-0001", "ecs-es-0002", "ecs-es-0003"]' }
+  tasks:
+    - blockinfile:
+        path: /etc/hosts
+        block: |
+          {% for i in groups.es %}
+          {{hostvars[i].ansible_eth0.ipv4.address}} {{hostvars[i].ansible_fqdn}} {{hostvars[i].ansible_hostname}}
+          {% endfor %}
+    - yum:
+        name: elasticsearch
+    - replace:
+        path: /etc/elasticsearch/elasticsearch.yml
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop: "{{ replacements }}"
+    - service:
+        name: elasticsearch
+        state: started
+        enabled: yes

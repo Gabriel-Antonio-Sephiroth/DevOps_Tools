@@ -1,0 +1,16 @@
+- hosts: web
+  tasks:
+    - yum:
+        name:
+          - httpd
+          - php
+          - nfs-utils
+    - blockinfile:
+        path: /etc/fstab
+        block: |
+          192.168.0.90:/html /var/www/html nfs defaults,_netdev 1 1
+    - service:
+        name: httpd
+        state: started
+        enabled: yes
+    - shell: mount -a
