@@ -1,0 +1,634 @@
+---
+# =============================================================
+# Apache Doris 存算一体集群自动化部署 Ansible 剧本
+# =============================================================
+# 前置条件:
+#   1. Ansible 被控节点需安装 pymysql，而主控节点需要安装 jmespath
+#      pip3 install jmespath(主控节点上执行)
+#   2. 所有目标节点已配置 SSH 免密登录
+# =============================================================
+# 剧本说明：
+#   案例设计为存算一体集群的自动化部署，各节点同时部署BE和FE服务
+#   若更改为存算分离集群的分布式部署，案例剧本需要更改设计
+# =============================================================
+
+- name: "Doris all-in-one computing and storage cluster - Ansible playbook for automated deployment"
+  hosts: doris
+  gather_facts: yes
+  vars:
+    doris_version: "4.1.0"
+    download_url: "https://download.selectdb.com/apache-doris-{{ doris_version }}-bin-x64.tar.gz"
+    download_dir: "/tmp/doris"
+    tar_name: "apache-doris-{{ doris_version }}-bin-x64.tar.gz"
+    unzip_name: "apache-doris-{{ doris_version }}-bin-x64"
+    install_dir: "/usr/local"
+    doris_name: "doris"
+    fe_conf: "fe/conf/fe.conf"
+    be_conf: "be/conf/be.conf"
+    fe_http_port: 8030
+    fe_rpc_port: 9020
+    fe_query_port: 9030
+    fe_edit_log_port: 9010
+    be_port: 9060
+    be_webserver_port: 8040
+    be_heartbeat_service_port: 9050
+    be_brpc_port: 4021
+    java_install: "java-17-openjdk-devel"
+    priority_networks: "172.25.195.0/24" # 按实际需求更改
+  tasks:
+
+    # ==================== Stage 1: 初始化环境 ====================
+    - name: Check if swap is configured in fstab
+      shell: grep -v "^#" /etc/fstab | grep -i swap || true
+      register: swap_in_fstab
+      changed_when: false
+
+    - name: Comment out swap in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*swap.*)'
+        replace: '# \1'
+      when: swap_in_fstab.stdout != ""
+
+    - name: Turn off swap
+      command: swapoff -a
+      ignore_errors: yes
+
+    - name: Check if java is installed
+      command: java --version
+      register: java_check
+
+    - name: install jdk
+      yum:
+        name: {{ java_install }}
+        state: present
+      when: java_check.rc != 0
+
+    - name: set JAVA_HOME env
+      block:
+        - name: Get node for JAVA_HOME path
+          shell: dirname $(dirname $(readlink -f $(which java)))
+          register: java_home_path
+          changed_when: false
+
+        - name: set JAVA_HOME into /etc/profile
+          lineinfile:
+            path: /etc/profile
+            line: 'export JAVA_HOME={{ java_home_path.stdout }}'
+            insertafter: EOF
+            state: present
+
+        - name: set JAVA_HOME into PATH
+          lineinfile:
+            path: /etc/profile
+            line: 'export PATH=$JAVA_HOME/bin:$PATH'
+            insertafter: EOF
+            state: present
+
+    - name: Configure Transparent Huge Pages
+      blockinfile:
+        path: /etc/rc.d/rc.local
+        block: |
+          echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+          echo madvise > /sys/kernel/mm/transparent_hugepage/defrag
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - THP CONFIG"
+        insertafter: EOF
+        create: yes
+        mode: '0755'
+
+    - name: Enable rc-local service
+      systemd:
+        name: rc-local
+        enabled: yes
+        state: started
+
+    - name: Configure vm.max_map_count
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: "vm.max_map_count = 2000000"
+        regexp: "^\\s*vm\\.max_map_count"
+
+    - name: Configure tcp_abort_on_overflow
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: "net.ipv4.tcp_abort_on_overflow = 1"
+        regexp: "^\\s*net\\.ipv4\\.tcp_abort_on_overflow"
+
+    - name: Apply sysctl settings
+      command: sysctl -p
+
+    - name: Configure nofile limits
+      blockinfile:
+        path: /etc/security/limits.conf
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - FILE HANDLE LIMITS"
+        block: |
+          * soft nofile 1000000
+          * hard nofile 1000000
+        insertafter: EOF
+
+    - name: Install PyMySQL on target hosts
+      yum:
+        name: python3-PyMySQL
+        state: present
+
+    # ==================== Stage 2: 安装并部署Doris集群 ====================
+    - name: Download and Extract Doris with Rename using tar extra_opts
+      block:
+      - name: check if tar_pkg of doris is exist
+        stat:
+          path: "{{ download_dir }}/{{ tar_name }}"
+        register: tar_exist
+
+      - name: check if unzip of doris is exist
+        stat:
+          path: "{{ install_dir }}/{{ doris_name }}"
+        register: doris_exist
+
+      # 统一端口冲突检查（仅首次安装时）
+      - name: Check all Doris port conflicts
+        wait_for:
+          port: "{{ item }}"
+          host: "{{ ansible_host }}"
+          state: absent
+          timeout: 5
+        loop:
+          - "{{ fe_http_port }}"
+          - "{{ fe_rpc_port }}"
+          - "{{ fe_query_port }}"
+          - "{{ fe_edit_log_port }}"
+          - "{{ be_port }}"
+          - "{{ be_webserver_port }}"
+          - "{{ be_heartbeat_service_port }}"
+          - "{{ be_brpc_port }}"
+        register: port_check_results
+        ignore_errors: true
+        changed_when: false
+        when: not doris_exist.stat.exists
+
+      - name: Fail if any Doris port is in use
+        fail:
+          msg: |
+            Port conflict detected on {{ ansible_host }}:
+            {% for result in port_check_results.results %}
+            {% if result is failed %}
+            - Port {{ result.item }} is already in use
+            {% endif %}
+            {% endfor %}
+        when: not doris_exist.stat.exists and (port_check_results.results | select('failed') | list | length > 0)
+
+      - name: download Apache Doris
+        get_url:
+          url: "{{ download_url }}"
+          dest: "{{ download_dir }}/{{ tar_name }}"
+          mode: '0644'
+          timeout: 300
+        register: download_result
+        when: not tar_exist.stat.exists and not doris_exist.stat.exists # 确保执行失败后复用剧本时不用重复下载
+
+      - name: use tar module to unzip
+        ansible.builtin.unarchive:
+          src: "{{ download_dir }}/{{ tar_name }}"
+          dest: "{{ install_dir }}"
+          remote_src: yes
+          owner: "{{ ansible_user | default('root') }}"
+          group: "{{ ansible_user | default('root') }}"
+          mode: '0755'
+          creates: "{{ install_dir }}/{{ doris_name }}" # 如果doris目录存在跳过解压
+        register: unzip_result
+        when: not doris_exist.stat.exists # 解压时文件不存在
+
+      - name: rename unzip dir to doris
+        shell: |
+          mv -f {{ install_dir }}/{{ unzip_name }} {{ install_dir }}/{{ doris_name }}
+        register: rename_result
+        when: not doris_exist.stat.exists and unzip_result is not skipped # 确保解压成功
+
+      - name: set dir permissions
+        file:
+          path: "{{ install_dir }}/{{ doris_name }}"
+          owner: "{{ ansible_user | default('root') }}"
+          group: "{{ ansible_user | default('root') }}"
+          mode: '0755'
+          recurse: no
+        when: not doris_exist.stat.exists and rename_result is not skipped and rename_result.rc == 0 # 确保重命名成功
+
+    # --- 备份配置文件 ---
+    - name: Backup FE config
+      copy:
+        src: "{{ install_dir }}/{{ doris_name }}/{{ fe_conf }}"
+        dest: "{{ install_dir }}/{{ doris_name }}/{{ fe_conf }}.backup"
+        remote_src: yes
+
+    - name: Backup BE config
+      copy:
+        src: "{{ install_dir }}/{{ doris_name }}/{{ be_conf }}"
+        dest: "{{ install_dir }}/{{ doris_name }}/{{ be_conf }}.backup"
+        remote_src: yes
+
+    # --- 修改 FE 配置 ---
+    - name: Modify FE config
+      blockinfile:
+        path: "{{ install_dir }}/{{ doris_name }}/{{ fe_conf }}"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - FE CONFIG"
+        block: |
+          cluster_id = -1
+          priority_networks = {{ priority_networks }}
+          JAVA_HOME = {{ java_home_path.stdout }}
+
+    # --- 修改 BE 配置 ---
+    - name: Modify BE config
+      blockinfile:
+        path: "{{ install_dir }}/{{ doris_name }}/{{ be_conf }}"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - BE CONFIG"
+        block: |
+          brpc_port = {{ be_brpc_port }}
+          priority_networks = {{ priority_networks }}
+
+    # --- 清理旧数据（首次部署或需要重建时设为 true） ---
+    - name: Clean old data
+      block:
+        - name: Clean FE metadata
+          file:
+            path: "{{ install_dir }}/{{ doris_name }}/fe/doris-meta"
+            state: absent
+        - name: Clean BE storage
+          file:
+            path: "{{ install_dir }}/{{ doris_name }}/be/storage"
+            state: absent
+        - name: Recreate FE metadata directory
+          file:
+            path: "{{ install_dir }}/{{ doris_name }}/fe/doris-meta"
+            state: directory
+            owner: "{{ ansible_user | default('root') }}"
+            group: "{{ ansible_user | default('root') }}"
+            mode: '0755'
+        - name: Recreate BE storage directory
+          file:
+            path: "{{ install_dir }}/{{ doris_name }}/be/storage"
+            state: directory
+            owner: "{{ ansible_user | default('root') }}"
+            group: "{{ ansible_user | default('root') }}"
+            mode: '0755'
+        - name: Clean FE PID
+          file:
+            path: "{{ install_dir }}/{{ doris_name }}/fe/bin/fe.pid"
+            state: absent
+        - name: Clean BE PID
+          file:
+            path: "{{ install_dir }}/{{ doris_name }}/be/bin/be.pid"
+            state: absent
+      when: clean_doris_data | default(false) | bool
+
+
+# ==================== Stage 3: 启动 Master FE 并注册 Slave FE ====================
+- name: "start Master FE service and register for FE service"
+  hosts: "{{ groups['doris'][0] }}"
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    install_dir: "/usr/local"
+    doris_name: "doris"
+    fe_query_port: 9030
+    fe_http_port: 8030
+    fe_edit_log_port: 9010
+    mysql_user: root
+    mysql_password: ""
+  tasks:
+
+    - name: Check if FE is already running
+      shell: |
+        FE_PID_FILE="{{ install_dir }}/{{ doris_name }}/fe/bin/fe.pid"
+        if [ -f "$FE_PID_FILE" ]; then
+          PID=$(cat "$FE_PID_FILE")
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "running"
+          else
+            rm -f "$FE_PID_FILE"
+            echo "not_running"
+          fi
+        else
+          echo "not_running"
+        fi
+      register: fe_running
+      changed_when: false
+
+    - name: Start Master FE service
+      shell: |
+        source /etc/profile
+        unset http_proxy
+        unset https_proxy
+        cd {{ install_dir }}/{{ doris_name }}/fe/bin
+        ./start_fe.sh --daemon
+      args:
+        executable: /bin/bash
+      when: fe_running.stdout == "not_running"
+
+    - name: Wait for Master FE query port to be ready
+      wait_for:
+        port: "{{ fe_query_port }}"
+        host: "{{ ansible_host }}"
+        timeout: 120
+        delay: 5
+
+    - name: Verify Master FE HTTP API is available
+      uri:
+        url: "http://{{ ansible_host }}:{{ fe_http_port }}/api/bootstrap"
+        method: GET
+        status_code: 200
+      register: fe_bootstrap
+      retries: 12
+      delay: 10
+      until: fe_bootstrap.status == 200
+
+    - name: Master FE started successfully
+      debug:
+        msg: "Master FE is running on {{ ansible_host }}"
+
+    - name: "Register Slave FE: {{ item }}"
+      community.mysql.mysql_query:
+        login_host: "{{ ansible_host }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+        login_port: "{{ fe_query_port }}"
+        query: "ALTER SYSTEM ADD FOLLOWER '{{ item }}:{{ fe_edit_log_port }}'"
+      loop: "{{ groups['doris'][1:] | map('extract', hostvars, 'ansible_host') | list }}"
+      register: add_follower_result
+      failed_when:
+        - add_follower_result is failed
+        - "'already' not in (add_follower_result.msg | default('') | string)"
+
+
+# ==================== Stage 4: 启动 Slave FE ====================
+- name: "start Slave FE service"
+  hosts: "{{ groups['doris'][1:] }}"
+  gather_facts: no
+  vars:
+    install_dir: "/usr/local"
+    doris_name: "doris"
+    # helper 地址指向第一个节点，端口使用 edit_log_port (9010)
+    master_fe_host: "{{ hostvars[groups['doris'][0]].ansible_host }}"
+    fe_edit_log_port: 9010
+    fe_query_port: 9030
+  tasks:
+
+    - name: Check if FE is already running
+      shell: |
+        FE_PID_FILE="{{ install_dir }}/{{ doris_name }}/fe/bin/fe.pid"
+        if [ -f "$FE_PID_FILE" ]; then
+          PID=$(cat "$FE_PID_FILE")
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "running"
+          else
+            rm -f "$FE_PID_FILE"
+            echo "not_running"
+          fi
+        else
+          echo "not_running"
+        fi
+      register: fe_running
+      changed_when: false
+
+    - name: Start Slave FE service
+      shell: |
+        source /etc/profile
+        unset http_proxy
+        unset https_proxy
+        cd {{ install_dir }}/{{ doris_name }}/fe/bin
+        ./start_fe.sh --helper {{ master_fe_host }}:{{ fe_edit_log_port }} --daemon
+      args:
+        executable: /bin/bash
+      when: fe_running.stdout == "not_running"
+
+    - name: Wait for Slave FE query port to be ready
+      wait_for:
+        port: "{{ fe_query_port }}"
+        host: "{{ ansible_host }}"
+        timeout: 120
+        delay: 5
+
+    - name: Slave FE started successfully
+      debug:
+        msg: "Slave FE is running on {{ ansible_host }}"
+
+
+# ==================== Stage 5: 验证 FE 集群 ====================
+- name: "verify the status of the FE cluster"
+  hosts: "{{ groups['doris'][0] }}"
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    fe_query_port: 9030
+    mysql_user: root
+    mysql_password: ""
+    expected_fe_count: "{{ groups['doris'] | length }}"
+  tasks:
+
+    - name: Query FE cluster status
+      community.mysql.mysql_query:
+        login_host: "{{ ansible_host }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+        login_port: "{{ fe_query_port }}"
+        query: "SHOW PROC '/frontends'"
+      register: fe_status
+      retries: 10
+      delay: 15
+      until: fe_status.query_result is defined
+
+    - name: Print FE cluster status
+      debug:
+        msg: |
+          FE Node: {{ item.Host }}
+            Role: {{ item.Role }}
+            IsMaster: {{ item.IsMaster }}
+            Alive: {{ item.Alive }}
+            EditLogPort: {{ item.EditLogPort }}
+      loop: "{{ fe_status.query_result[0] }}"
+      when: fe_status.query_result is defined
+
+    - name: Verify all FE nodes are alive
+      assert:
+        that:
+          - item.Alive == "true"
+        fail_msg: "FE node {{ item.Host }} is NOT alive!"
+        success_msg: "FE node {{ item.Host }} is alive (Role={{ item.Role }}, IsMaster={{ item.IsMaster }})"
+      loop: "{{ fe_status.query_result[0] }}"
+      when: fe_status.query_result is defined
+
+    - name: Verify FE node count
+      assert:
+        that:
+          - (fe_status.query_result[0] | length) == (expected_fe_count | int)
+        fail_msg: |
+          FE count mismatch! Expected: {{ expected_fe_count }}, Actual: {{ fe_status.query_result[0] | length }}
+        success_msg: "All {{ expected_fe_count }} FE nodes joined the cluster"
+
+
+# ==================== Stage 6: 启动所有 BE ====================
+- name: "start BE service"
+  hosts: doris
+  gather_facts: no
+  vars:
+    install_dir: "/usr/local"
+    doris_name: "doris"
+    be_heartbeat_service_port: 9050
+  tasks:
+
+    - name: Check if BE is already running
+      shell: |
+        BE_PID_FILE="{{ install_dir }}/{{ doris_name }}/be/bin/be.pid"
+        if [ -f "$BE_PID_FILE" ]; then
+          PID=$(cat "$BE_PID_FILE")
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "running"
+          else
+            rm -f "$BE_PID_FILE"
+            echo "not_running"
+          fi
+        else
+          echo "not_running"
+        fi
+      register: be_running
+      changed_when: false
+
+    - name: Start BE service
+      shell: |
+        source /etc/profile
+        unset http_proxy
+        unset https_proxy
+        cd {{ install_dir }}/{{ doris_name }}/be/bin
+        ./start_be.sh --daemon
+      args:
+        executable: /bin/bash
+      when: be_running.stdout == "not_running"
+
+    - name: Wait for BE heartbeat port to be ready
+      wait_for:
+        port: "{{ be_heartbeat_service_port }}"
+        host: "{{ ansible_host }}"
+        timeout: 120
+        delay: 5
+      when: be_running.stdout == "not_running"
+
+    - name: BE started successfully
+      debug:
+        msg: "BE is running on {{ ansible_host }}"
+
+
+# ==================== Stage 7: 注册所有 BE 到集群 ====================
+- name: "register all FE service to cluster"
+  hosts: "{{ groups['doris'][0] }}"
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    fe_query_port: 9030
+    be_heartbeat_service_port: 9050
+    mysql_user: root
+    mysql_password: ""
+  tasks:
+
+    # 每个 BE 节点单独执行一条 ALTER SYSTEM ADD BACKEND
+    - name: Add BE to cluster
+      community.mysql.mysql_query:
+        login_host: "{{ ansible_host }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+        login_port: "{{ fe_query_port }}"
+        query: "ALTER SYSTEM ADD BACKEND '{{ item }}:{{ be_heartbeat_service_port }}'"
+      loop: "{{ groups['doris'] | map('extract', hostvars, 'ansible_host') | list }}"
+      register: add_backend_result
+      # 如果 BE 已注册会返回错误，忽略此情况
+      failed_when:
+        - add_backend_result is failed
+        - "'already' not in (add_backend_result.msg | default('') | string)"
+
+    - name: Wait for all BE nodes to report heartbeat
+      pause:
+        seconds: 10
+
+
+# ==================== Stage 8: 集群状态最终验证 ====================
+- name: "Verify the status of the cluster"
+  hosts: "{{ groups['doris'][0] }}"
+  gather_facts: no
+  vars:
+    fe_query_port: 9030
+    mysql_user: root
+    mysql_password: ""
+    expected_node_count: "{{ groups['doris'] | length }}"
+  tasks:
+
+    - name: Query FE cluster status
+      community.mysql.mysql_query:
+        login_host: "{{ ansible_host }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+        login_port: "{{ fe_query_port }}"
+        query: "SHOW PROC '/frontends'"
+      register: final_fe_status
+
+    - name: Query BE cluster status
+      community.mysql.mysql_query:
+        login_host: "{{ ansible_host }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+        login_port: "{{ fe_query_port }}"
+        query: "SHOW PROC '/backends'"
+      register: final_be_status
+
+    - name: Print BE cluster details
+      debug:
+        msg: |
+          BackendId: {{ item.BackendId }}
+            Host: {{ item.Host }}:{{ item.HeartbeatPort }}
+            Alive: {{ item.Alive }}
+            TabletNum: {{ item.TabletNum }}
+            AvailCapacity: {{ item.AvailCapacity }}
+            UsedPct: {{ item.UsedPct }}
+            Version: {{ item.Version }}
+      loop: "{{ final_be_status.query_result[0] }}"
+      when: final_be_status.query_result is defined
+
+    - name: Calculate cluster statistics
+      set_fact:
+        alive_fe_count: "{{ final_fe_status.query_result[0] | selectattr('Alive', 'equalto', 'true') | list | length }}"
+        alive_be_count: "{{ final_be_status.query_result[0] | selectattr('Alive', 'equalto', 'true') | list | length }}"
+        total_be_count: "{{ final_be_status.query_result[0] | length }}"
+
+    - name: Verify cluster deployment completeness
+      assert:
+        that:
+          - alive_fe_count | int == expected_node_count | int
+          - alive_be_count | int == expected_node_count | int
+        fail_msg: |
+          ========================================
+          Cluster deployment FAILED!
+          Expected nodes: {{ expected_node_count }}
+          Alive FE: {{ alive_fe_count }} / {{ expected_node_count }}
+          Alive BE: {{ alive_be_count }} / {{ expected_node_count }}
+          ========================================
+        success_msg: |
+          ========================================
+          Cluster deployment SUCCESS!
+          All {{ expected_node_count }} FE nodes and {{ expected_node_count }} BE nodes are alive.
+          ========================================
+
+
+# ==================== Stage 9: 清理安装包 ====================
+- name: "remove tar package from all nodes"
+  hosts: doris
+  gather_facts: no
+  vars:
+    doris_version: "4.1.0"
+    download_dir: "/tmp/doris"
+    tar_name: "apache-doris-{{ doris_version }}-bin-x64.tar.gz"
+  tasks:
+
+    - name: Remove tar package from all nodes
+      file:
+        path: "{{ download_dir }}/{{ tar_name }}"
+        state: absent
+
+    - name: Deployment cleanup completed
+      debug:
+        msg: "Cleaned up installation package on {{ inventory_hostname }}"
