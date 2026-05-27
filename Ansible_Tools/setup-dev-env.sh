@@ -49,7 +49,7 @@ dnf install -y java-21-openjdk-devel
 # 安装 pip,rocky自带python
 dnf install -y python3-pip
 # 安装常用工具
-dnf install -y vim-enhanced bash-completion wget curl git tree htop ncdu net-tools bind-utils telnet lsof unzip zip sshpass
+dnf install -y createrepo_c vim-enhanced bash-completion wget curl git tree htop ncdu net-tools bind-utils telnet lsof unzip zip sshpass
 # 安装Docker
 dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 dnf install -y docker-ce --allowerasing
